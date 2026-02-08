@@ -63,6 +63,9 @@ const sampleJitter = (server: ServerState) => {
 const canAcceptOnServer = (server: ServerState) =>
   server.isUp && server.inflight.length < server.maxConnections;
 
+const electLeader = (loadBalancers: LoadBalancerState[]) =>
+  loadBalancers.find((lb) => lb.isUp) ?? null;
+
 export const stepSimulation = (
   prev: SimulationState,
   dtMs: number
@@ -77,6 +80,9 @@ export const stepSimulation = (
     recentLatencies: [...prev.recentLatencies],
     totals: { ...prev.totals },
   };
+  for (const lb of state.loadBalancers) {
+    lb.currentRequests = 0;
+  }
 
   let completedThisTick = 0;
   let failedThisTick = 0;
@@ -95,6 +101,7 @@ export const stepSimulation = (
           timeMs: state.timeMs,
           status: "started",
           message: `Request ${next.id} started on ${server.id} after queue`,
+          serverId: server.id,
         });
       }
     }
@@ -107,6 +114,7 @@ export const stepSimulation = (
         req.latencyMs = state.timeMs - req.arrivalTimeMs;
         completedThisTick += 1;
         state.totals.completed += 1;
+        server.totalProcessed += 1;
         addLatencySample(state, req.latencyMs);
         pushLog(state, {
           id: req.id,
@@ -115,6 +123,7 @@ export const stepSimulation = (
           message: `Request ${req.id} completed on ${server.id} in ${Math.round(
             req.latencyMs
           )}ms`,
+          serverId: server.id,
         });
       } else {
         stillInflight.push(req);
@@ -129,7 +138,16 @@ export const stepSimulation = (
   const arrivals = Math.floor(state.pendingRemainder + expected);
   state.pendingRemainder = state.pendingRemainder + expected - arrivals;
 
-  const leader = state.loadBalancers.find((lb) => lb.id === state.leaderLbId) ?? null;
+  const getLeader = () =>
+    state.loadBalancers.find((lb) => lb.id === state.leaderLbId) ?? null;
+
+  const ensureLeader = () => {
+    const leader = getLeader();
+    if (leader && leader.isUp) return leader;
+    const replacement = electLeader(state.loadBalancers);
+    state.leaderLbId = replacement?.id ?? null;
+    return replacement;
+  };
 
   for (let i = 0; i < arrivals; i += 1) {
     const requestId = state.nextRequestId++;
@@ -141,16 +159,52 @@ export const stepSimulation = (
       status: "failed",
     };
 
+    const leader = ensureLeader();
     if (!leader || !leader.isUp) {
       req.failureReason = "load balancer unavailable";
       failedThisTick += 1;
       state.totals.failed += 1;
+      server.totalFailed += 1;
       pushLog(state, {
         id: req.id,
         timeMs: state.timeMs,
         status: "failed",
         message: `Request ${req.id} failed: ${req.failureReason}`,
+        lbId: leader?.id,
       });
+      continue;
+    }
+
+    leader.currentRequests += 1;
+    const maxThisTick = Math.max(
+      1,
+      Math.floor((leader.maxThroughputRps * dtMs) / 1000)
+    );
+    if (leader.currentRequests > maxThisTick) {
+      leader.isUp = false;
+      req.failureReason = "load balancer overloaded";
+      failedThisTick += 1;
+      state.totals.failed += 1;
+      const replacement = electLeader(
+        state.loadBalancers.filter((lb) => lb.id !== leader.id)
+      );
+      state.leaderLbId = replacement?.id ?? null;
+      pushLog(state, {
+        id: req.id,
+        timeMs: state.timeMs,
+        status: "failed",
+        message: `Request ${req.id} failed: ${req.failureReason}`,
+        lbId: leader.id,
+      });
+      if (replacement) {
+        pushLog(state, {
+          id: req.id,
+          timeMs: state.timeMs,
+          status: "started",
+          message: `Leader switched to ${replacement.id} after overload`,
+          lbId: replacement.id,
+        });
+      }
       continue;
     }
 
@@ -182,11 +236,13 @@ export const stepSimulation = (
       req.failureReason = selection.reason;
       failedThisTick += 1;
       state.totals.failed += 1;
+      server.totalFailed += 1;
       pushLog(state, {
         id: req.id,
         timeMs: state.timeMs,
         status: "failed",
         message: `Request ${req.id} failed: ${req.failureReason}`,
+        lbId: leader.id,
       });
       continue;
     }
@@ -200,11 +256,13 @@ export const stepSimulation = (
       req.failureReason = "server not found";
       failedThisTick += 1;
       state.totals.failed += 1;
+      server.totalFailed += 1;
       pushLog(state, {
         id: req.id,
         timeMs: state.timeMs,
         status: "failed",
         message: `Request ${req.id} failed: ${req.failureReason}`,
+        lbId: leader.id,
       });
       continue;
     }
@@ -220,6 +278,8 @@ export const stepSimulation = (
         timeMs: state.timeMs,
         status: "failed",
         message: `Request ${req.id} failed: ${req.failureReason}`,
+        lbId: leader.id,
+        serverId: server.id,
       });
       continue;
     }
@@ -233,6 +293,8 @@ export const stepSimulation = (
         timeMs: state.timeMs,
         status: "failed",
         message: `Request ${req.id} failed: ${req.failureReason}`,
+        lbId: leader.id,
+        serverId: server.id,
       });
       continue;
     }
@@ -253,6 +315,8 @@ export const stepSimulation = (
         timeMs: state.timeMs,
         status: "started",
         message: `Request ${req.id} -> ${server.id} (${selection.reason})`,
+        lbId: leader.id,
+        serverId: server.id,
       });
     } else if (server.queue.length < server.queueLimit) {
       req.status = "queued";
@@ -262,6 +326,8 @@ export const stepSimulation = (
         timeMs: state.timeMs,
         status: "queued",
         message: `Request ${req.id} queued on ${server.id} (${selection.reason})`,
+        lbId: leader.id,
+        serverId: server.id,
       });
     } else {
       req.status = "failed";
@@ -273,6 +339,8 @@ export const stepSimulation = (
         timeMs: state.timeMs,
         status: "failed",
         message: `Request ${req.id} failed: ${req.failureReason}`,
+        lbId: leader.id,
+        serverId: server.id,
       });
     }
   }
@@ -320,6 +388,8 @@ export const createInitialState = (): SimulationState => {
       jitterMs: 30,
       slowFactor: 1,
       dropRate: 0,
+      totalProcessed: 0,
+      totalFailed: 0,
       inflight: [],
       queue: [],
     },
@@ -333,6 +403,8 @@ export const createInitialState = (): SimulationState => {
       jitterMs: 35,
       slowFactor: 1,
       dropRate: 0,
+      totalProcessed: 0,
+      totalFailed: 0,
       inflight: [],
       queue: [],
     },
@@ -346,6 +418,8 @@ export const createInitialState = (): SimulationState => {
       jitterMs: 25,
       slowFactor: 1,
       dropRate: 0,
+      totalProcessed: 0,
+      totalFailed: 0,
       inflight: [],
       queue: [],
     },
@@ -356,6 +430,8 @@ export const createInitialState = (): SimulationState => {
       id: "lb-1",
       name: "LB Alpha",
       isUp: true,
+      currentRequests: 0,
+      maxThroughputRps: 30,
       decisionLatencyMs: 8,
       staleHealth: false,
       healthIntervalMs: 3000,

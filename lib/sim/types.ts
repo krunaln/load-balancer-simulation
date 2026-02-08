@@ -28,6 +28,8 @@ export type ServerState = {
   jitterMs: number;
   slowFactor: number;
   dropRate: number;
+  totalProcessed: number;
+  totalFailed: number;
   inflight: Request[];
   queue: Request[];
 };
@@ -36,6 +38,8 @@ export type LoadBalancerState = {
   id: string;
   name: string;
   isUp: boolean;
+  currentRequests: number;
+  maxThroughputRps: number;
   decisionLatencyMs: number;
   staleHealth: boolean;
   healthIntervalMs: number;
@@ -48,6 +52,8 @@ export type LogEntry = {
   timeMs: number;
   status: RequestStatus;
   message: string;
+  serverId?: string;
+  lbId?: string;
 };
 
 export type MetricsPoint = {

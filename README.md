@@ -1,36 +1,64 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Load Balancer Scenario Lab
 
-## Getting Started
+![Load Balancer Scenario Lab](public/screenshot.png)
 
-First, run the development server:
+An educational load balancer simulator built with Next.js. The app presents scenario-based lessons that explain how different load-balancing strategies behave under varying conditions. Each scenario is a scripted walkthrough with a topology diagram (clients → load balancer → servers), step-by-step narration, and clear takeaways.
+
+## What This Teaches
+
+- How different algorithms route traffic (Round Robin, Weighted RR, etc.)
+- When a strategy works well and where it fails
+- How slow nodes or uneven capacity affect outcomes
+
+## Product Experience
+
+- Scenario list on the left
+- System design diagram on the canvas
+- Step-by-step narration placed near the relevant node or edge
+- Manual Next/Prev navigation (no auto-advance)
+- Scenario intro modal before each walkthrough
+
+
+## Quick Start
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open `http://localhost:3000` in your browser.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Project Structure
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- `app/home-client.tsx` – UI, canvas, callouts, and scenario flow
+- `lib/scenario-learning.ts` – Scenario definitions and scripted steps
 
-## Learn More
+## Adding a Scenario
 
-To learn more about Next.js, take a look at the following resources:
+1. Open `lib/scenario-learning.ts`.
+2. Add a new object in the `scenarios` array.
+3. Define:
+   - `base` topology (clients, LBs, servers)
+   - `steps` with `highlightNodeIds`, `highlightEdgeIds`, and scripted stats
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Example step:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```ts
+{
+  id: "example-step",
+  title: "Routing begins",
+  text: "Requests are routed to the least busy server.",
+  highlightEdgeIds: ["edge-lb-1-srv-2"],
+  stats: {
+    servers: { "srv-2": { active: 6, processed: 10 } },
+  },
+}
+```
 
-## Deploy on Vercel
+## Design Notes
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+The simulator is intentionally deterministic and scripted. It prioritizes clarity and explanation over real-time simulation or stochastic behavior.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## License
+
+MIT

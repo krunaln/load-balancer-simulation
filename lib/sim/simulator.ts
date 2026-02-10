@@ -8,9 +8,9 @@ import type {
   SimulationState,
 } from "./types";
 
-const LOG_LIMIT = 220;
-const METRICS_LIMIT = 120;
-const LATENCY_WINDOW = 200;
+const LOG_LIMIT = 260;
+const METRICS_LIMIT = 160;
+const SAMPLE_LIMIT = 260;
 
 const cloneServer = (server: ServerState): ServerState => ({
   ...server,
@@ -20,6 +20,7 @@ const cloneServer = (server: ServerState): ServerState => ({
 
 const cloneLb = (lb: LoadBalancerState): LoadBalancerState => ({
   ...lb,
+  queue: [...lb.queue],
   healthSnapshot: { ...lb.healthSnapshot },
 });
 
@@ -30,41 +31,75 @@ const pushLog = (state: SimulationState, entry: SimulationState["log"][0]) => {
   }
 };
 
-const addLatencySample = (state: SimulationState, latencyMs: number) => {
-  state.recentLatencies.push(latencyMs);
-  if (state.recentLatencies.length > LATENCY_WINDOW) {
-    state.recentLatencies.splice(0, state.recentLatencies.length - LATENCY_WINDOW);
+const pushSample = (values: number[], value: number) => {
+  values.push(value);
+  if (values.length > SAMPLE_LIMIT) {
+    values.splice(0, values.length - SAMPLE_LIMIT);
   }
 };
 
-const computeAvgLatency = (latencies: number[]) => {
-  if (!latencies.length) return 0;
-  const total = latencies.reduce((sum, value) => sum + value, 0);
-  return total / latencies.length;
+const avg = (values: number[]) =>
+  values.length
+    ? values.reduce((sum, value) => sum + value, 0) / values.length
+    : 0;
+
+const p95 = (values: number[]) => {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95));
+  return sorted[index];
+};
+
+const electLeader = (loadBalancers: LoadBalancerState[]) =>
+  loadBalancers.find((lb) => lb.isUp) ?? null;
+
+const isServerAvailable = (server: ServerState, timeMs: number) => {
+  if (server.health === "DOWN") return false;
+  if (server.circuitBreakerUntilMs > timeMs) return false;
+  const capacityOpen = server.inflight.length < server.maxConcurrentRequests;
+  const queueOpen = server.queue.length < server.serverQueueSize;
+  return capacityOpen || queueOpen;
 };
 
 const updateHealthSnapshot = (
   lb: LoadBalancerState,
   servers: ServerState[],
-  timeMs: number
+  timeMs: number,
+  intervalMs: number,
+  recoveryDelayMs: number
 ) => {
-  if (timeMs - lb.lastHealthCheckMs < lb.healthIntervalMs) return;
+  if (timeMs - lb.lastHealthCheckMs < intervalMs) return;
   lb.lastHealthCheckMs = timeMs;
+
+  for (const server of servers) {
+    if (server.health === "DOWN") {
+      if (timeMs - server.lastHealthChangeMs >= recoveryDelayMs) {
+        server.health = "UP";
+        server.lastHealthChangeMs = timeMs;
+      }
+    }
+  }
+
   lb.healthSnapshot = Object.fromEntries(
-    servers.map((server) => [server.id, server.isUp])
+    servers.map((server) => [
+      server.id,
+      server.health !== "DOWN" && server.circuitBreakerUntilMs <= timeMs,
+    ])
   );
 };
 
-const sampleJitter = (server: ServerState) => {
-  if (server.jitterMs <= 0) return 0;
-  return (Math.random() * 2 - 1) * server.jitterMs;
+const computeProcessingTime = (
+  server: ServerState,
+  alpha: number
+): number => {
+  const utilization =
+    server.maxConcurrentRequests === 0
+      ? 1
+      : server.inflight.length / server.maxConcurrentRequests;
+  const multiplier =
+    server.health === "SLOW" ? server.slowMultiplier : 1;
+  return server.baseLatencyMs * multiplier * (1 + alpha * utilization ** 2);
 };
-
-const canAcceptOnServer = (server: ServerState) =>
-  server.isUp && server.inflight.length < server.maxConnections;
-
-const electLeader = (loadBalancers: LoadBalancerState[]) =>
-  loadBalancers.find((lb) => lb.isUp) ?? null;
 
 export const stepSimulation = (
   prev: SimulationState,
@@ -78,58 +113,13 @@ export const stepSimulation = (
     log: [...prev.log],
     metrics: [...prev.metrics],
     recentLatencies: [...prev.recentLatencies],
+    recentLbWaits: [...prev.recentLbWaits],
+    recentServerWaits: [...prev.recentServerWaits],
     totals: { ...prev.totals },
   };
+
   for (const lb of state.loadBalancers) {
-    lb.currentRequests = 0;
-  }
-
-  let completedThisTick = 0;
-  let failedThisTick = 0;
-
-  for (const server of state.servers) {
-    if (server.isUp) {
-      while (server.queue.length && canAcceptOnServer(server)) {
-        const next = server.queue.shift();
-        if (!next) break;
-        next.startTimeMs = state.timeMs;
-        next.remainingTimeMs = next.serviceTimeMs;
-        next.status = "started";
-        server.inflight.push(next);
-        pushLog(state, {
-          id: next.id,
-          timeMs: state.timeMs,
-          status: "started",
-          message: `Request ${next.id} started on ${server.id} after queue`,
-          serverId: server.id,
-        });
-      }
-    }
-
-    const stillInflight: Request[] = [];
-    for (const req of server.inflight) {
-      req.remainingTimeMs -= dtMs;
-      if (req.remainingTimeMs <= 0) {
-        req.status = "completed";
-        req.latencyMs = state.timeMs - req.arrivalTimeMs;
-        completedThisTick += 1;
-        state.totals.completed += 1;
-        server.totalProcessed += 1;
-        addLatencySample(state, req.latencyMs);
-        pushLog(state, {
-          id: req.id,
-          timeMs: state.timeMs,
-          status: "completed",
-          message: `Request ${req.id} completed on ${server.id} in ${Math.round(
-            req.latencyMs
-          )}ms`,
-          serverId: server.id,
-        });
-      } else {
-        stillInflight.push(req);
-      }
-    }
-    server.inflight = stillInflight;
+    lb.activeConnections = 0;
   }
 
   const workload = getWorkload(state.workloadId);
@@ -138,33 +128,39 @@ export const stepSimulation = (
   const arrivals = Math.floor(state.pendingRemainder + expected);
   state.pendingRemainder = state.pendingRemainder + expected - arrivals;
 
-  const getLeader = () =>
-    state.loadBalancers.find((lb) => lb.id === state.leaderLbId) ?? null;
-
   const ensureLeader = () => {
-    const leader = getLeader();
-    if (leader && leader.isUp) return leader;
+    const current = state.loadBalancers.find((lb) => lb.id === state.leaderLbId);
+    if (current && current.isUp) return current;
     const replacement = electLeader(state.loadBalancers);
     state.leaderLbId = replacement?.id ?? null;
     return replacement;
   };
+
+  const leader = ensureLeader();
+
+  for (const lb of state.loadBalancers) {
+    updateHealthSnapshot(
+      lb,
+      state.servers,
+      state.timeMs,
+      state.healthCheckIntervalMs,
+      state.recoveryDelayMs
+    );
+  }
 
   for (let i = 0; i < arrivals; i += 1) {
     const requestId = state.nextRequestId++;
     const req: Request = {
       id: requestId,
       arrivalTimeMs: state.timeMs,
-      serviceTimeMs: 0,
-      remainingTimeMs: 0,
-      status: "failed",
+      lbQueueEnterMs: state.timeMs,
+      status: "arrived",
     };
 
-    const leader = ensureLeader();
     if (!leader || !leader.isUp) {
+      req.status = "failed";
       req.failureReason = "load balancer unavailable";
-      failedThisTick += 1;
       state.totals.failed += 1;
-      server.totalFailed += 1;
       pushLog(state, {
         id: req.id,
         timeMs: state.timeMs,
@@ -175,197 +171,264 @@ export const stepSimulation = (
       continue;
     }
 
-    leader.currentRequests += 1;
-    const maxThisTick = Math.max(
-      1,
-      Math.floor((leader.maxThroughputRps * dtMs) / 1000)
-    );
-    if (leader.currentRequests > maxThisTick) {
-      leader.isUp = false;
-      req.failureReason = "load balancer overloaded";
-      failedThisTick += 1;
-      state.totals.failed += 1;
-      const replacement = electLeader(
-        state.loadBalancers.filter((lb) => lb.id !== leader.id)
-      );
-      state.leaderLbId = replacement?.id ?? null;
+    if (leader.queue.length >= leader.queueSize) {
+      leader.droppedRequests += 1;
+      state.totals.droppedLb += 1;
+      req.status = "failed";
+      req.failureReason = "lb queue full (503)";
       pushLog(state, {
         id: req.id,
         timeMs: state.timeMs,
         status: "failed",
-        message: `Request ${req.id} failed: ${req.failureReason}`,
+        message: `Request ${req.id} rejected: ${req.failureReason}`,
         lbId: leader.id,
       });
-      if (replacement) {
+      continue;
+    }
+
+    req.status = "lb-queued";
+    leader.queue.push(req);
+  }
+
+  if (leader && leader.isUp) {
+    const maxPerTick = Math.max(
+      0,
+      Math.floor((leader.maxConnectionsPerSecond * dtMs) / 1000)
+    );
+    let routedThisTick = 0;
+
+    while (
+      leader.queue.length &&
+      routedThisTick < maxPerTick &&
+      leader.activeConnections < leader.maxConcurrentConnections
+    ) {
+      const req = leader.queue.shift();
+      if (!req) break;
+      req.lbQueueExitMs = state.timeMs;
+      req.lbQueueWaitMs = req.lbQueueExitMs - (req.lbQueueEnterMs ?? req.arrivalTimeMs);
+      pushSample(state.recentLbWaits, req.lbQueueWaitMs);
+
+      const algorithm = getAlgorithm(leader.routingAlgorithm ?? state.algorithmId);
+      const availableIds = state.servers
+        .filter((server) =>
+          leader.healthSnapshot[server.id] &&
+          isServerAvailable(server, state.timeMs)
+        )
+        .map((server) => server.id);
+
+      const selection = algorithm.select({
+        servers: state.servers,
+        availableIds,
+        rrIndex: state.rrIndex,
+        requestId: req.id,
+      });
+
+      if (selection.rrIndex !== undefined) {
+        state.rrIndex = selection.rrIndex;
+      }
+
+      if (!selection.serverId) {
+        req.status = "failed";
+        req.failureReason = selection.reason;
+        state.totals.failed += 1;
         pushLog(state, {
           id: req.id,
           timeMs: state.timeMs,
-          status: "started",
-          message: `Leader switched to ${replacement.id} after overload`,
-          lbId: replacement.id,
+          status: "failed",
+          message: `Request ${req.id} failed: ${req.failureReason}`,
+          lbId: leader.id,
         });
+        continue;
       }
-      continue;
+
+      const server = state.servers.find((item) => item.id === selection.serverId);
+      if (!server) {
+        req.status = "failed";
+        req.failureReason = "server not found";
+        state.totals.failed += 1;
+        pushLog(state, {
+          id: req.id,
+          timeMs: state.timeMs,
+          status: "failed",
+          message: `Request ${req.id} failed: ${req.failureReason}`,
+          lbId: leader.id,
+        });
+        continue;
+      }
+
+      if (!isServerAvailable(server, state.timeMs)) {
+        req.status = "failed";
+        req.failureReason = "server unavailable";
+        state.totals.failed += 1;
+        server.totalFailed += 1;
+        pushLog(state, {
+          id: req.id,
+          timeMs: state.timeMs,
+          status: "failed",
+          message: `Request ${req.id} failed: ${req.failureReason}`,
+          lbId: leader.id,
+          serverId: server.id,
+        });
+        continue;
+      }
+
+      req.lbId = leader.id;
+      req.serverId = server.id;
+      req.algorithmId = algorithm.id;
+      req.decisionReason = selection.reason;
+
+      leader.activeConnections += 1;
+      routedThisTick += 1;
+
+      if (server.inflight.length < server.maxConcurrentRequests) {
+        req.startProcessingMs = state.timeMs;
+        req.processingTimeMs = computeProcessingTime(server, state.ewmaAlpha);
+        req.remainingTimeMs = req.processingTimeMs;
+        req.status = "processing";
+        server.inflight.push(req);
+        state.totals.started += 1;
+        pushLog(state, {
+          id: req.id,
+          timeMs: state.timeMs,
+          status: "processing",
+          message: `Request ${req.id} -> ${server.id} (${selection.reason})`,
+          lbId: leader.id,
+          serverId: server.id,
+        });
+      } else if (server.queue.length < server.serverQueueSize) {
+        req.serverQueueEnterMs = state.timeMs;
+        req.status = "server-queued";
+        server.queue.push(req);
+        pushLog(state, {
+          id: req.id,
+          timeMs: state.timeMs,
+          status: "server-queued",
+          message: `Request ${req.id} queued on ${server.id} (${selection.reason})`,
+          lbId: leader.id,
+          serverId: server.id,
+        });
+      } else {
+        req.status = "failed";
+        req.failureReason = "server queue full (503)";
+        state.totals.failed += 1;
+        state.totals.droppedServer += 1;
+        server.totalFailed += 1;
+        server.circuitBreakerUntilMs = state.timeMs + state.recoveryDelayMs;
+        pushLog(state, {
+          id: req.id,
+          timeMs: state.timeMs,
+          status: "failed",
+          message: `Request ${req.id} failed: ${req.failureReason}`,
+          lbId: leader.id,
+          serverId: server.id,
+        });
+        leader.activeConnections = Math.max(0, leader.activeConnections - 1);
+      }
     }
+  }
 
-    req.lbId = leader.id;
-    if (leader.staleHealth) {
-      updateHealthSnapshot(leader, state.servers, state.timeMs);
-    } else {
-      leader.healthSnapshot = Object.fromEntries(
-        state.servers.map((server) => [server.id, server.isUp])
-      );
-    }
+  for (const server of state.servers) {
+    while (
+      server.queue.length &&
+      server.inflight.length < server.maxConcurrentRequests
+    ) {
+      const req = server.queue.shift();
+      if (!req) break;
+      req.serverQueueExitMs = state.timeMs;
+      req.serverQueueWaitMs =
+        (req.serverQueueExitMs ?? state.timeMs) -
+        (req.serverQueueEnterMs ?? state.timeMs);
+      pushSample(state.recentServerWaits, req.serverQueueWaitMs);
 
-    const perceivedAvailable = state.servers
-      .filter((server) => leader.healthSnapshot[server.id])
-      .map((server) => server.id);
-
-    const algorithm = getAlgorithm(state.algorithmId);
-    const selection = algorithm.select({
-      servers: state.servers,
-      availableIds: perceivedAvailable,
-      rrIndex: state.rrIndex,
-    });
-
-    if (selection.rrIndex !== undefined) {
-      state.rrIndex = selection.rrIndex;
-    }
-
-    if (!selection.serverId) {
-      req.failureReason = selection.reason;
-      failedThisTick += 1;
-      state.totals.failed += 1;
-      server.totalFailed += 1;
-      pushLog(state, {
-        id: req.id,
-        timeMs: state.timeMs,
-        status: "failed",
-        message: `Request ${req.id} failed: ${req.failureReason}`,
-        lbId: leader.id,
-      });
-      continue;
-    }
-
-    const server = state.servers.find((item) => item.id === selection.serverId);
-    req.serverId = selection.serverId;
-    req.algorithmId = state.algorithmId;
-    req.decisionReason = selection.reason;
-
-    if (!server) {
-      req.failureReason = "server not found";
-      failedThisTick += 1;
-      state.totals.failed += 1;
-      server.totalFailed += 1;
-      pushLog(state, {
-        id: req.id,
-        timeMs: state.timeMs,
-        status: "failed",
-        message: `Request ${req.id} failed: ${req.failureReason}`,
-        lbId: leader.id,
-      });
-      continue;
-    }
-
-    if (!server.isUp) {
-      req.failureReason = leader.staleHealth
-        ? "server down (stale health)"
-        : "server down";
-      failedThisTick += 1;
-      state.totals.failed += 1;
-      pushLog(state, {
-        id: req.id,
-        timeMs: state.timeMs,
-        status: "failed",
-        message: `Request ${req.id} failed: ${req.failureReason}`,
-        lbId: leader.id,
-        serverId: server.id,
-      });
-      continue;
-    }
-
-    if (Math.random() < server.dropRate) {
-      req.failureReason = "dropped by server";
-      failedThisTick += 1;
-      state.totals.failed += 1;
-      pushLog(state, {
-        id: req.id,
-        timeMs: state.timeMs,
-        status: "failed",
-        message: `Request ${req.id} failed: ${req.failureReason}`,
-        lbId: leader.id,
-        serverId: server.id,
-      });
-      continue;
-    }
-
-    const decisionLatency = leader.decisionLatencyMs;
-    const baseLatency = server.baseLatencyMs * server.slowFactor;
-    const serviceTime = Math.max(10, baseLatency + sampleJitter(server));
-    req.serviceTimeMs = serviceTime + decisionLatency;
-    req.remainingTimeMs = req.serviceTimeMs;
-
-    if (server.inflight.length < server.maxConnections) {
-      req.status = "started";
-      req.startTimeMs = state.timeMs;
+      req.startProcessingMs = state.timeMs;
+      req.processingTimeMs = computeProcessingTime(server, state.ewmaAlpha);
+      req.remainingTimeMs = req.processingTimeMs;
+      req.status = "processing";
       server.inflight.push(req);
       state.totals.started += 1;
-      pushLog(state, {
-        id: req.id,
-        timeMs: state.timeMs,
-        status: "started",
-        message: `Request ${req.id} -> ${server.id} (${selection.reason})`,
-        lbId: leader.id,
-        serverId: server.id,
-      });
-    } else if (server.queue.length < server.queueLimit) {
-      req.status = "queued";
-      server.queue.push(req);
-      pushLog(state, {
-        id: req.id,
-        timeMs: state.timeMs,
-        status: "queued",
-        message: `Request ${req.id} queued on ${server.id} (${selection.reason})`,
-        lbId: leader.id,
-        serverId: server.id,
-      });
-    } else {
-      req.status = "failed";
-      req.failureReason = "queue full";
-      failedThisTick += 1;
-      state.totals.failed += 1;
-      pushLog(state, {
-        id: req.id,
-        timeMs: state.timeMs,
-        status: "failed",
-        message: `Request ${req.id} failed: ${req.failureReason}`,
-        lbId: leader.id,
-        serverId: server.id,
-      });
     }
+
+    const stillInflight: Request[] = [];
+    for (const req of server.inflight) {
+      if (req.remainingTimeMs === undefined) {
+        req.remainingTimeMs = 0;
+      }
+      req.remainingTimeMs -= dtMs;
+      if (req.remainingTimeMs <= 0) {
+        req.endTimeMs = state.timeMs;
+        req.status = "completed";
+        req.lbQueueWaitMs =
+          (req.lbQueueExitMs ?? state.timeMs) -
+          (req.lbQueueEnterMs ?? req.arrivalTimeMs);
+        req.serverQueueWaitMs =
+          (req.serverQueueExitMs ?? state.timeMs) -
+          (req.serverQueueEnterMs ?? req.startProcessingMs ?? state.timeMs);
+        req.processingTimeMs = req.processingTimeMs ?? 0;
+        req.latencyMs = req.endTimeMs - req.arrivalTimeMs;
+
+        pushSample(state.recentLatencies, req.latencyMs);
+        pushSample(state.recentLbWaits, req.lbQueueWaitMs);
+        pushSample(state.recentServerWaits, req.serverQueueWaitMs);
+
+        server.totalProcessed += 1;
+        state.totals.completed += 1;
+        server.ewmaLatencyMs =
+          state.ewmaAlpha * (req.latencyMs ?? 0) +
+          (1 - state.ewmaAlpha) * server.ewmaLatencyMs;
+
+        const lb = state.loadBalancers.find((item) => item.id === req.lbId);
+        if (lb) {
+          lb.activeConnections = Math.max(0, lb.activeConnections - 1);
+        }
+
+        pushLog(state, {
+          id: req.id,
+          timeMs: state.timeMs,
+          status: "completed",
+          message: `Request ${req.id} completed on ${server.id} in ${Math.round(
+            req.latencyMs
+          )}ms`,
+          lbId: req.lbId,
+          serverId: server.id,
+        });
+      } else {
+        stillInflight.push(req);
+      }
+    }
+    server.inflight = stillInflight;
   }
 
   const totalInflight = state.servers.reduce(
     (sum, server) => sum + server.inflight.length,
     0
   );
-  const totalQueued = state.servers.reduce(
+  const totalServerQueued = state.servers.reduce(
     (sum, server) => sum + server.queue.length,
     0
   );
+  const totalLbQueued = state.loadBalancers.reduce(
+    (sum, lb) => sum + lb.queue.length,
+    0
+  );
 
-  const avgLatency = computeAvgLatency(state.recentLatencies);
-  const totalProcessed = completedThisTick + failedThisTick;
-  const failureRate = totalProcessed
-    ? (failedThisTick / totalProcessed) * 100
-    : 0;
+  const avgLatency = avg(state.recentLatencies);
+  const p95Latency = p95(state.recentLatencies);
+  const failureTotal = state.totals.failed + state.totals.droppedLb + state.totals.droppedServer;
+  const totalProcessed = state.totals.completed + failureTotal;
+  const failureRate = totalProcessed ? (failureTotal / totalProcessed) * 100 : 0;
 
   const point: MetricsPoint = {
     timeMs: state.timeMs,
     avgLatencyMs: avgLatency,
-    queueDepth: totalQueued,
+    p95LatencyMs: p95Latency,
+    lbQueueDepth: totalLbQueued,
+    serverQueueDepth: totalServerQueued,
     inflight: totalInflight,
     failureRate,
+    dropsLb: state.totals.droppedLb,
+    dropsServer: state.totals.droppedServer,
+    avgLbWaitMs: avg(state.recentLbWaits),
+    avgServerWaitMs: avg(state.recentServerWaits),
   };
 
   state.metrics.push(point);
@@ -377,51 +440,58 @@ export const stepSimulation = (
 };
 
 export const createInitialState = (): SimulationState => {
+  const tickMs = 1000;
   const servers: ServerState[] = [
     {
       id: "srv-1",
       name: "Server 1",
-      isUp: true,
-      maxConnections: 12,
-      queueLimit: 18,
+      health: "UP",
       baseLatencyMs: 160,
-      jitterMs: 30,
-      slowFactor: 1,
-      dropRate: 0,
-      totalProcessed: 0,
-      totalFailed: 0,
+      slowMultiplier: 1.8,
+      weight: 1,
+      maxConcurrentRequests: 12,
+      serverQueueSize: 18,
       inflight: [],
       queue: [],
+      totalProcessed: 0,
+      totalFailed: 0,
+      ewmaLatencyMs: 180,
+      circuitBreakerUntilMs: 0,
+      lastHealthChangeMs: 0,
     },
     {
       id: "srv-2",
       name: "Server 2",
-      isUp: true,
-      maxConnections: 10,
-      queueLimit: 16,
-      baseLatencyMs: 180,
-      jitterMs: 35,
-      slowFactor: 1,
-      dropRate: 0,
-      totalProcessed: 0,
-      totalFailed: 0,
+      health: "UP",
+      baseLatencyMs: 190,
+      slowMultiplier: 1.8,
+      weight: 1,
+      maxConcurrentRequests: 10,
+      serverQueueSize: 16,
       inflight: [],
       queue: [],
+      totalProcessed: 0,
+      totalFailed: 0,
+      ewmaLatencyMs: 200,
+      circuitBreakerUntilMs: 0,
+      lastHealthChangeMs: 0,
     },
     {
       id: "srv-3",
       name: "Server 3",
-      isUp: true,
-      maxConnections: 14,
-      queueLimit: 20,
+      health: "UP",
       baseLatencyMs: 140,
-      jitterMs: 25,
-      slowFactor: 1,
-      dropRate: 0,
-      totalProcessed: 0,
-      totalFailed: 0,
+      slowMultiplier: 1.8,
+      weight: 1,
+      maxConcurrentRequests: 14,
+      serverQueueSize: 20,
       inflight: [],
       queue: [],
+      totalProcessed: 0,
+      totalFailed: 0,
+      ewmaLatencyMs: 170,
+      circuitBreakerUntilMs: 0,
+      lastHealthChangeMs: 0,
     },
   ];
 
@@ -430,35 +500,46 @@ export const createInitialState = (): SimulationState => {
       id: "lb-1",
       name: "LB Alpha",
       isUp: true,
-      currentRequests: 0,
-      maxThroughputRps: 30,
-      decisionLatencyMs: 8,
-      staleHealth: false,
+      maxConnectionsPerSecond: 40,
+      maxConcurrentConnections: 60,
+      queueSize: 120,
+      droppedRequests: 0,
+      queue: [],
+      activeConnections: 0,
+      routingAlgorithm: "round-robin",
       healthIntervalMs: 3000,
       lastHealthCheckMs: 0,
       healthSnapshot: Object.fromEntries(
-        servers.map((server) => [server.id, server.isUp])
+        servers.map((server) => [server.id, server.health !== "DOWN"])
       ),
     },
   ];
 
   return {
     timeMs: 0,
+    tickMs,
     nextRequestId: 1,
     pendingRemainder: 0,
     recentLatencies: [],
+    recentLbWaits: [],
+    recentServerWaits: [],
     algorithmId: "round-robin",
     workloadId: "steady",
     rrIndex: 0,
-    servers,
+    ewmaAlpha: 0.2,
     loadBalancers,
     leaderLbId: "lb-1",
+    servers,
     log: [],
     metrics: [],
     totals: {
       completed: 0,
       failed: 0,
       started: 0,
+      droppedLb: 0,
+      droppedServer: 0,
     },
+    healthCheckIntervalMs: 3000,
+    recoveryDelayMs: 8000,
   };
 };
